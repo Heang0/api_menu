@@ -5,15 +5,20 @@ const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Get bot token from environment variable (set this in Render)
+// Get bot token from environment variable
 const BOT_TOKEN = process.env.BOT_TOKEN || '8338081238:AAHeUKy9XL7kgeUUvXdQExCMp9nQtqUhrFQ';
 const API_BASE_URL = 'https://menuqrcode.onrender.com/api';
 
-// Initialize bot with polling
+// Initialize bot with better configuration
 const bot = new TelegramBot(BOT_TOKEN, { 
-  polling: true,
+  polling: {
+    interval: 3000,
+    timeout: 10,
+    retryTimeout: 10000
+  },
   request: {
-    timeout: 10000
+    timeout: 15000,
+    proxy: false
   }
 });
 
@@ -44,55 +49,113 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
     platform: 'nodejs',
-    timestamp: new Date().toISOString(),
-    service: 'YSG Telegram Bot'
+    timestamp: new Date().toISOString()
   });
 });
 
-// API helper function
-async function apiRequest(endpoint) {
-  try {
-    console.log(`🔄 Fetching: ${API_BASE_URL}${endpoint}`);
-    const response = await axios.get(`${API_BASE_URL}${endpoint}`, { timeout: 10000 });
-    console.log(`✅ Success: ${endpoint}`);
-    return response.data;
-  } catch (error) {
-    console.error(`❌ API Error (${endpoint}):`, error.message);
-    return null;
+// API helper function with retry logic
+async function apiRequest(endpoint, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      console.log(`🔄 Fetching (attempt ${attempt}/${retries}): ${endpoint}`);
+      
+      const response = await axios.get(`${API_BASE_URL}${endpoint}`, { 
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'YSGTelegramBot/1.0'
+        }
+      });
+      
+      console.log(`✅ Success: ${endpoint}`);
+      return response.data;
+      
+    } catch (error) {
+      console.error(`❌ API Error (${endpoint}, attempt ${attempt}):`, error.message);
+      
+      if (error.response?.status === 429) {
+        // Rate limited - wait and retry
+        const waitTime = Math.min(1000 * Math.pow(2, attempt), 10000); // Exponential backoff
+        console.log(`⏳ Rate limited, waiting ${waitTime}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        continue;
+      }
+      
+      if (attempt === retries) {
+        return null;
+      }
+      
+      // Wait before retry for other errors
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
   }
+  return null;
 }
 
-// Start command - shows store info and categories
+// Cache to avoid frequent API calls
+const cache = {
+  store: null,
+  categories: null,
+  products: null,
+  lastFetch: 0
+};
+
+const CACHE_DURATION = 60000; // 1 minute cache
+
+async function getCachedData() {
+  const now = Date.now();
+  
+  // Return cached data if it's fresh
+  if (cache.store && cache.categories && cache.products && 
+      (now - cache.lastFetch) < CACHE_DURATION) {
+    console.log('📦 Using cached data');
+    return {
+      store: cache.store,
+      categories: cache.categories,
+      products: cache.products
+    };
+  }
+  
+  // Fetch fresh data
+  console.log('🔄 Fetching fresh data from API');
+  const [store, categories, products] = await Promise.all([
+    apiRequest('/stores/public/slug/ysg'),
+    apiRequest('/categories/store/slug/ysg').catch(() => null),
+    apiRequest('/products/public-store/slug/ysg')
+  ]);
+  
+  if (store && products) {
+    cache.store = store;
+    cache.categories = categories;
+    cache.products = products;
+    cache.lastFetch = now;
+  }
+  
+  return { store, categories, products };
+}
+
+// Start command
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
   console.log(`🚀 /start command from chat ${chatId}`);
   
   try {
-    // Show loading message
     await bot.sendMessage(chatId, '🔄 Loading YSG Store menu...');
     
-    const store = await apiRequest('/stores/public/slug/ysg');
+    const { store, categories, products } = await getCachedData();
+    
     if (!store) {
-      await bot.sendMessage(chatId, '❌ Store not available at the moment. Please try again later.');
+      await bot.sendMessage(chatId, 
+        '❌ Store is temporarily unavailable.\n\n' +
+        'This might be due to high traffic. Please try again in a few moments.'
+      );
       return;
     }
 
-    // Get categories
-    const categories = await apiRequest(`/categories/store/${store._id}`);
-    
     // Create store info message
     let storeInfo = `🏪 *${store.name}*\n\n`;
     if (store.description) storeInfo += `📝 ${store.description}\n`;
     if (store.address) storeInfo += `📍 ${store.address}\n`;
     if (store.phone) storeInfo += `📞 ${store.phone}\n`;
-
-    // Add social links if available
-    if (store.facebookUrl || store.telegramUrl || store.websiteUrl) {
-      storeInfo += '\n🔗 Follow us:\n';
-      if (store.facebookUrl) storeInfo += `• [Facebook](${store.facebookUrl})\n`;
-      if (store.telegramUrl) storeInfo += `• [Telegram](${store.telegramUrl})\n`;
-      if (store.websiteUrl) storeInfo += `• [Website](${store.websiteUrl})\n`;
-    }
 
     // Send store info
     await bot.sendMessage(chatId, storeInfo, { parse_mode: 'Markdown' });
@@ -103,27 +166,34 @@ bot.onText(/\/start/, async (msg) => {
         { text: `📂 ${category.name}` }
       ]);
       
-      // Add "All Items" and "Refresh" buttons
       keyboard.push([{ text: '🍽️ All Items' }]);
-      keyboard.push([{ text: '🔄 Refresh Menu' }]);
+      keyboard.push([{ text: '🔄 Refresh' }]);
       
       const replyMarkup = {
         keyboard: keyboard,
-        resize_keyboard: true,
-        one_time_keyboard: false
+        resize_keyboard: true
       };
       
-      await bot.sendMessage(chatId, '📋 *Select a category to browse products:*', {
+      await bot.sendMessage(chatId, '📋 *Select a category:*', {
         parse_mode: 'Markdown',
         reply_markup: replyMarkup
       });
     } else {
-      await bot.sendMessage(chatId, '📭 No categories available at the moment.');
+      // Fallback: show all items if no categories
+      await bot.sendMessage(chatId, 
+        '📋 *Menu Categories*\n\n' +
+        '📂 All Items\n\n' +
+        'Select "All Items" to browse the menu.',
+        { parse_mode: 'Markdown' }
+      );
     }
     
   } catch (error) {
     console.error('Start command error:', error);
-    await bot.sendMessage(chatId, '❌ Error loading store information. Please try /start again.');
+    await bot.sendMessage(chatId, 
+      '❌ Unable to load menu at the moment.\n\n' +
+      'Please try again in a few minutes.'
+    );
   }
 });
 
@@ -134,70 +204,73 @@ bot.on('message', async (msg) => {
 
   if (text && text.startsWith('📂 ')) {
     const categoryName = text.slice(2);
-    console.log(`📂 Category selected: ${categoryName} by chat ${chatId}`);
+    console.log(`📂 Category selected: ${categoryName}`);
     
     try {
       await bot.sendMessage(chatId, `🔄 Loading ${categoryName}...`);
       
-      const store = await apiRequest('/stores/public/slug/ysg');
-      if (!store) {
-        await bot.sendMessage(chatId, '❌ Store not available');
+      const { store, categories, products } = await getCachedData();
+      
+      if (!store || !products) {
+        await bot.sendMessage(chatId, '❌ Menu temporarily unavailable');
         return;
       }
 
-      const products = await apiRequest('/products/public-store/slug/ysg');
-      const categories = await apiRequest(`/categories/store/${store._id}`);
+      let categoryProducts = [];
       
-      const category = categories.find(cat => cat.name === categoryName);
+      if (categories && categories.length > 0) {
+        const category = categories.find(cat => cat.name === categoryName);
+        if (category) {
+          categoryProducts = products.filter(product => 
+            product.category && product.category._id === category._id
+          );
+        }
+      }
       
-      if (category && products) {
-        const categoryProducts = products.filter(product => 
-          product.category && product.category._id === category._id
+      // If no specific category found or no categories, show all products
+      if (categoryProducts.length === 0) {
+        categoryProducts = products;
+      }
+
+      if (categoryProducts.length > 0) {
+        await bot.sendMessage(chatId, 
+          `📂 *${categoryName}*\n_${categoryProducts.length} items_`,
+          { parse_mode: 'Markdown' }
         );
 
-        if (categoryProducts.length > 0) {
-          // Send category header
-          await bot.sendMessage(chatId, `📂 *${categoryName}*\n_${categoryProducts.length} items available_`, {
-            parse_mode: 'Markdown'
-          });
-
-          // Send each product with image
-          for (const product of categoryProducts) {
-            const price = product.price ? ` - ${product.price} 💵` : '';
-            const available = product.isAvailable === false ? '❌ ' : '✅ ';
-            const caption = `${available}*${product.title}*${price}\n${product.description || ''}`;
-            
-            const imageUrl = product.image || product.imageUrl;
-            
-            if (imageUrl) {
-              try {
-                await bot.sendPhoto(chatId, imageUrl, {
-                  caption: caption,
-                  parse_mode: 'Markdown'
-                });
-                // Small delay to avoid rate limits
-                await new Promise(resolve => setTimeout(resolve, 500));
-              } catch (photoError) {
-                console.log('Photo send failed, sending as text:', photoError.message);
-                await bot.sendMessage(chatId, caption, { parse_mode: 'Markdown' });
-              }
-            } else {
+        // Send products in batches to avoid rate limits
+        for (let i = 0; i < categoryProducts.length; i++) {
+          const product = categoryProducts[i];
+          const price = product.price ? ` - ${product.price}` : '';
+          const caption = `✅ *${product.title}*${price}\n${product.description || ''}`;
+          
+          const imageUrl = product.image || product.imageUrl;
+          
+          if (imageUrl) {
+            try {
+              await bot.sendPhoto(chatId, imageUrl, {
+                caption: caption,
+                parse_mode: 'Markdown'
+              });
+            } catch (photoError) {
               await bot.sendMessage(chatId, caption, { parse_mode: 'Markdown' });
             }
+          } else {
+            await bot.sendMessage(chatId, caption, { parse_mode: 'Markdown' });
           }
           
-        } else {
-          await bot.sendMessage(chatId, `📭 No items found in *${categoryName}*`, {
-            parse_mode: 'Markdown'
-          });
+          // Add delay between messages to avoid rate limits
+          if (i < categoryProducts.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
         }
       } else {
-        await bot.sendMessage(chatId, '❌ Category not found');
+        await bot.sendMessage(chatId, `📭 No items found in ${categoryName}`);
       }
       
     } catch (error) {
       console.error('Category error:', error);
-      await bot.sendMessage(chatId, '❌ Error loading category. Please try again.');
+      await bot.sendMessage(chatId, '❌ Error loading category');
     }
   }
 });
@@ -208,37 +281,23 @@ bot.on('message', async (msg) => {
   const text = msg.text;
 
   if (text === '🍽️ All Items') {
-    console.log(`🍽️ All Items selected by chat ${chatId}`);
+    console.log(`🍽️ All Items selected`);
     
     try {
       await bot.sendMessage(chatId, '🔄 Loading all menu items...');
       
-      const products = await apiRequest('/products/public-store/slug/ysg');
+      const { products } = await getCachedData();
       
       if (products && products.length > 0) {
-        // Group by category for better organization
-        const productsByCategory = {};
-        products.forEach(product => {
-          const categoryName = product.category ? product.category.name : 'Uncategorized';
-          if (!productsByCategory[categoryName]) {
-            productsByCategory[categoryName] = [];
-          }
-          productsByCategory[categoryName].push(product);
-        });
+        await bot.sendMessage(chatId, 
+          `🍽️ *All Menu Items*\n_${products.length} items total_`,
+          { parse_mode: 'Markdown' }
+        );
 
-        // Send category summary first
-        let summary = '🍽️ *All Menu Items*\n\n';
-        Object.keys(productsByCategory).forEach(category => {
-          summary += `📂 ${category}: ${productsByCategory[category].length} items\n`;
-        });
-        
-        await bot.sendMessage(chatId, summary, { parse_mode: 'Markdown' });
-
-        // Send each product with image
-        for (const product of products) {
-          const price = product.price ? ` - ${product.price} 💵` : '';
-          const available = product.isAvailable === false ? '❌ ' : '✅ ';
-          const caption = `${available}*${product.title}*${price}\n${product.description || ''}`;
+        for (let i = 0; i < products.length; i++) {
+          const product = products[i];
+          const price = product.price ? ` - ${product.price}` : '';
+          const caption = `✅ *${product.title}*${price}\n${product.description || ''}`;
           
           const imageUrl = product.image || product.imageUrl;
           
@@ -248,25 +307,25 @@ bot.on('message', async (msg) => {
                 caption: caption,
                 parse_mode: 'Markdown'
               });
-              // Small delay to avoid rate limits
-              await new Promise(resolve => setTimeout(resolve, 500));
             } catch (photoError) {
-              console.log('Photo send failed, sending as text:', photoError.message);
               await bot.sendMessage(chatId, caption, { parse_mode: 'Markdown' });
             }
           } else {
             await bot.sendMessage(chatId, caption, { parse_mode: 'Markdown' });
           }
+          
+          // Add delay between messages
+          if (i < products.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
         }
-        
-        await bot.sendMessage(chatId, `✅ Loaded ${products.length} items total`);
       } else {
-        await bot.sendMessage(chatId, '📭 No items found in the menu');
+        await bot.sendMessage(chatId, '📭 No items found');
       }
       
     } catch (error) {
       console.error('All items error:', error);
-      await bot.sendMessage(chatId, '❌ Error loading menu. Please try again.');
+      await bot.sendMessage(chatId, '❌ Error loading menu');
     }
   }
 });
@@ -276,9 +335,13 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
 
-  if (text === '🔄 Refresh Menu') {
-    console.log(`🔄 Refresh requested by chat ${chatId}`);
-    // Simply trigger the start command again
+  if (text === '🔄 Refresh') {
+    console.log(`🔄 Refresh requested`);
+    // Clear cache and restart
+    cache.store = null;
+    cache.categories = null;
+    cache.products = null;
+    
     const fakeMsg = { ...msg, text: '/start' };
     bot.emit('message', fakeMsg);
   }
@@ -287,74 +350,38 @@ bot.on('message', async (msg) => {
 // Help command
 bot.onText(/\/help/, (msg) => {
   const chatId = msg.chat.id;
-  console.log(`❓ Help command from chat ${chatId}`);
-  
   const helpText = `🤖 *YSG Menu Bot Help*
 
 *Commands:*
-/start - Show store menu and categories
-/help - Show this help message
+/start - Show store menu
+/help - Show this help
 
-*Features:*
-• 🏪 View store information
-• 📂 Browse products by category  
-• 🍽️ See all items at once
-• 🖼️ View product images
-• 💵 See prices and descriptions
-• 🔄 Refresh to get latest menu
+*Tips:*
+• Use buttons to navigate
+• Images load automatically
+• Refresh if menu seems old
 
-*How to use:*
-1. Send /start to begin
-2. Use the buttons to navigate
-3. Tap any category to see products
-4. Products with images will be shown
-
-*Need help?* Contact the store directly.`;
+The bot caches data for 1 minute to avoid API limits.`;
 
   bot.sendMessage(chatId, helpText, { parse_mode: 'Markdown' });
 });
 
-// Handle unknown commands
-bot.on('message', (msg) => {
-  const chatId = msg.chat.id;
-  const text = msg.text;
-
-  // Only respond to text messages that aren't commands or buttons we handle
-  if (text && 
-      !text.startsWith('/') && 
-      !text.startsWith('📂 ') && 
-      text !== '🍽️ All Items' && 
-      text !== '🔄 Refresh Menu') {
-    bot.sendMessage(chatId, '🤔 I didn\'t understand that. Send /start to see the menu or /help for assistance.');
-  }
+// Error handling
+bot.on('polling_error', (error) => {
+  console.error('📡 Polling error (non-fatal):', error.message);
 });
 
-// Error handling
 bot.on('error', (error) => {
   console.error('🤖 Bot error:', error);
 });
 
-bot.on('polling_error', (error) => {
-  console.error('📡 Polling error:', error);
-});
-
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 YSG Telegram Bot server running on port ${PORT}`);
-  console.log(`🤖 Bot started with token: ${BOT_TOKEN.substring(0, 10)}...`);
-  console.log(`🌐 Health check: http://localhost:${PORT}/health`);
-  console.log(`✅ Bot is ready! Send /start in Telegram to test.`);
+  console.log(`🚀 YSG Bot running on port ${PORT}`);
+  console.log(`✅ Bot is ready!`);
 });
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('🛑 Shutting down bot gracefully...');
-  bot.stopPolling();
-  process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-  console.log('🛑 Received SIGTERM, shutting down...');
-  bot.stopPolling();
-  process.exit(0);
-});
+// Keep the process alive
+setInterval(() => {
+  // Keep-alive
+}, 60000);
