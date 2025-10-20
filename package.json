@@ -1,10 +1,11 @@
 {
   "name": "ysg-telegram-bot",
   "version": "1.0.0",
-  "description": "YSG Store Telegram Bot",
+  "description": "YSG Store Telegram Bot with Image Support",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
   "dependencies": {
     "node-telegram-bot-api": "^0.64.0",
@@ -13,5 +14,8 @@
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "keywords": ["telegram", "bot", "menu", "ysg"],
+  "author": "YSG Store",
+  "license": "MIT"
 }
